@@ -20,6 +20,8 @@ class FileTransferService {
   Stream<FileTransferModel> get transferStream => _transferController.stream;
 
   final Map<String, FileTransferModel> _activeTransfers = {};
+  
+  int get port => _server?.port ?? 0;
 
   OnIncomingFileCallback? onIncomingFile;
 
@@ -121,7 +123,14 @@ class FileTransferService {
       }
     });
 
-    _server = await shelf_io.serve(router, InternetAddress.anyIPv4, 0);
+    // Use fixed port 42425 for easier auto-linking on hotspots
+    const fixedPort = 42425;
+    try {
+       _server = await shelf_io.serve(router, InternetAddress.anyIPv4, fixedPort);
+    } catch (e) {
+       // Fallback to random port if 42425 is busy
+       _server = await shelf_io.serve(router, InternetAddress.anyIPv4, 0);
+    }
     print('Server running on port ${_server!.port}');
     return _server!.port;
   }
