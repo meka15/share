@@ -95,6 +95,20 @@ class _HomeScreenState extends State<HomeScreen> {
     AppConfig.transferService.onIncomingFile = (fileName, peerName) async {
       return await _showAcceptDialog(fileName, peerName);
     };
+
+    // 7. CRITICAL: When a peer sends us a file, register them in discovery
+    // This is the key fix: after receiving a file, the PC now knows the phone's IP and port
+    AppConfig.transferService.onPeerConnected = (peerIp, peerPort, peerId, peerName) {
+      print('Peer connected via HTTP: $peerName ($peerIp:$peerPort)');
+      AppConfig.discoveryService.addOrRefreshDevice(SharedDeviceInfo(
+        id: peerId,
+        name: peerName,
+        ip: peerIp,
+        port: peerPort,
+        type: 'mobile',
+        lastSeen: DateTime.now(),
+      ));
+    };
   }
 
   Future<bool> _showAcceptDialog(String fileName, String peerName) async {
@@ -125,6 +139,15 @@ class _HomeScreenState extends State<HomeScreen> {
       final file = File(result.files.single.path!);
       final myName = await DeviceUtil.getDeviceName();
       
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Sending to ${device.name}...'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+      
       try {
         await AppConfig.transferService.sendFile(
           peerIp: device.ip,
@@ -132,10 +155,19 @@ class _HomeScreenState extends State<HomeScreen> {
           file: file,
           myName: myName,
         );
-      } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+            const SnackBar(content: Text('File sent successfully!'), backgroundColor: Colors.green),
+          );
+        }
+      } catch (e) {
+        print('Send file error: $e');
+        if (mounted) {
+          final errorMsg = e.toString().contains('Cannot reach peer')
+              ? 'Cannot reach device. Make sure both devices are on the same network.'
+              : 'Send failed: ${e.toString().length > 100 ? e.toString().substring(0, 100) : e}';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(errorMsg), backgroundColor: Colors.red, duration: const Duration(seconds: 5)),
           );
         }
       }
@@ -218,15 +250,25 @@ class _HomeScreenState extends State<HomeScreen> {
                           
                           setState(() => _isHotspotStarting = true);
                           final success = await ConnectivityService.startHotspot(ssid: ssid, password: password);
+                          
                           if (success) {
                             await AppConfig.discoveryService.restart(port: AppConfig.transferService.port);
                           }
+
                           setState(() {
                             _isHotspotActive = success;
                             _isHotspotStarting = false;
                           });
                           
-                          if (mounted) _showMyQr(ssid: ssid, password: password);
+                          if (mounted) {
+                            if (success) {
+                              _showMyQr(ssid: ssid, password: password, isHotspot: true);
+                            } else {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('Failed to start hotspot. Please check permissions.'), backgroundColor: Colors.red),
+                              );
+                            }
+                          }
                         },
                       ),
                     ],
@@ -381,11 +423,11 @@ class _HomeScreenState extends State<HomeScreen> {
           final parts = _myIp!.split('.');
           if (parts.length == 4) {
              final gatewayIp = '${parts[0]}.${parts[1]}.${parts[2]}.1';
-             AppConfig.discoveryService.addDevice(SharedDeviceInfo(
+             AppConfig.discoveryService.addOrRefreshDevice(SharedDeviceInfo(
                id: 'pc_qr_${data['s']}', 
                name: 'Link: PC Host',
                ip: gatewayIp,
-               port: (data['v'] != null && data['v'] != 0) ? data['v'] : 42424,
+               port: (data['v'] != null && data['v'] != 0) ? data['v'] : 42425,
                type: 'desktop',
                lastSeen: DateTime.now(),
              ));
@@ -423,11 +465,11 @@ class _HomeScreenState extends State<HomeScreen> {
       await Future.delayed(const Duration(seconds: 4));
 
       if (ip != null && ip != '0.0.0.0') {
-        AppConfig.discoveryService.addDevice(SharedDeviceInfo(
+        AppConfig.discoveryService.addOrRefreshDevice(SharedDeviceInfo(
           id: 'manual_${DateTime.now().millisecondsSinceEpoch}',
           name: 'Link: Direct Device',
           ip: ip,
-          port: (port == null || port == 0) ? 42424 : port,
+          port: (port == null || port == 0) ? 42425 : port,
           type: 'unknown',
           lastSeen: DateTime.now(),
         ));
@@ -457,7 +499,7 @@ class _HomeScreenState extends State<HomeScreen> {
              if (parts.length == 4) {
                final gatewayIp = '${parts[0]}.${parts[1]}.${parts[2]}.1';
                if (gatewayIp != _myIp) {
-                 AppConfig.discoveryService.addDevice(SharedDeviceInfo(
+                 AppConfig.discoveryService.addOrRefreshDevice(SharedDeviceInfo(
                    id: 'auto_host_link',
                    name: 'Host Gateway (Direct)',
                    ip: gatewayIp,
@@ -475,31 +517,67 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  void _showMyQr({String? ssid, String? password}) async {
-    final ip = await ConnectivityService.getLocalIp() ?? '0.0.0.0';
+  void _showMyQr({String? ssid, String? password, bool isHotspot = false}) async {
+    // Show a loading dialog while we wait for the network to stabilize
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    String? ip;
+    for (int i = 0; i < 10; i++) {
+      ip = await ConnectivityService.getLocalIp();
+      if (ip != null && ip != '0.0.0.0') break;
+      await Future.delayed(const Duration(seconds: 1));
+    }
+    
+    if (mounted) Navigator.pop(context); // Close loading dialog
+
+    if (ip == null || ip == '0.0.0.0') {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not detect Network IP. Please check if WiFi/Hotspot is on.')),
+        );
+      }
+      return;
+    }
+
     final myName = await DeviceUtil.getDeviceName();
+    // Use 'join_pc' type even for phone-to-phone if it's a hotspot, because join_pc triggers the auto-connect logic
     final qrData = ConnectivityService.generateQrData(
-      type: 'direct',
+      type: isHotspot ? 'join_pc' : 'direct',
       ssid: ssid ?? '',
       password: password ?? '',
       ip: ip,
       port: AppConfig.transferService.port, 
     );
 
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF16213E),
-        title: Text('My ID: $myName', style: const TextStyle(color: Colors.white)),
-        content: Container(
-          width: 250,
-          height: 250,
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
-          child: QrImageView(data: qrData, size: 200),
+    if (mounted) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          backgroundColor: const Color(0xFF16213E),
+          title: Text('My ID: $myName', style: const TextStyle(color: Colors.white)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 250,
+                height: 250,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
+                child: QrImageView(data: qrData, size: 200),
+              ),
+              const SizedBox(height: 16),
+              const Text('Scan with another phone to join', style: TextStyle(color: Colors.white70, fontSize: 12)),
+            ],
+          ),
         ),
-      ),
-    );
+      );
+    }
   }
 
   @override
@@ -651,12 +729,10 @@ class _HomeScreenState extends State<HomeScreen> {
               child: Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    SizedBox(
-                      height: 100,
-                      child: Icon(Icons.wifi_tethering_outlined, size: 80, color: Colors.blueAccent.withOpacity(0.3)),
-                    ),
-                    const SizedBox(height: 16),
+                    Icon(Icons.wifi_tethering_outlined, size: 60, color: Colors.blueAccent.withOpacity(0.3)),
+                    const SizedBox(height: 12),
                     const Text('Scanning for devices...', style: TextStyle(color: Colors.white70)),
                   ],
                 ),

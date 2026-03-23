@@ -39,6 +39,14 @@ class ConnectivityService {
       final wifiIp = await _info.getWifiIP().timeout(const Duration(milliseconds: 500), onTimeout: () => null);
       if (wifiIp != null && wifiIp != '0.0.0.0') return wifiIp;
 
+      // 4. Android Special: If we are a Hotspot, we are almost always 192.168.43.1 or 192.168.44.1
+      if (Platform.isAndroid) {
+        final isApEn = await WiFiForIoTPlugin.isWiFiAPEnabled();
+        if (isApEn) {
+          return '192.168.43.1'; // Standard Android AP Gateway
+        }
+      }
+
     } catch (e) {
       print('Error getting local IP: $e');
     }
@@ -66,8 +74,20 @@ class ConnectivityService {
   static Future<bool> startHotspot({required String ssid, required String password}) async {
     if (Platform.isAndroid) {
       try {
-        await WiFiForIoTPlugin.setWiFiAPEnabled(true);
-        return true;
+        print('Android: Force starting hotspot...');
+        // Force wifi OFF first (often required to start AP)
+        await WiFiForIoTPlugin.forceWifiUsage(false);
+        await WiFiForIoTPlugin.setEnabled(false);
+        await Future.delayed(const Duration(milliseconds: 500));
+        
+        final success = await WiFiForIoTPlugin.setWiFiAPEnabled(true);
+        if (success) {
+           print('Android Hotspot started successfully.');
+           // Set the SSID/Password if supported (some plugins require separate call)
+           // But usually WiFiForIoTPlugin.setWiFiAPEnabled(true) uses system settings.
+           // For full control across all Android versions, this is sometimes limited.
+        }
+        return success;
       } catch (e) {
         print('Android Hotspot error: $e');
         return false;
@@ -79,23 +99,34 @@ class ConnectivityService {
         String? wifiInterface;
         if (ifaceResult.exitCode == 0) {
            for (final line in ifaceResult.stdout.toString().split('\n')) {
-             if (line.endsWith(':wifi')) {
+             if (line.contains(':wifi')) {
                wifiInterface = line.split(':')[0];
                break;
              }
            }
         }
 
-        final args = ['device', 'wifi', 'hotspot', 'ssid', ssid, 'password', password];
-        if (wifiInterface != null) {
-          args.addAll(['ifname', wifiInterface]);
+        if (wifiInterface == null) {
+          print('Linux: No WiFi interface found.');
+          return false;
         }
+
+        const conName = 'Antigravity-Hotspot';
+        await Process.run('nmcli', ['connection', 'delete', conName]);
+        await Process.run('nmcli', ['device', 'set', wifiInterface, 'managed', 'yes']);
+        await Process.run('nmcli', ['device', 'disconnect', wifiInterface]);
+
+        final result = await Process.run('nmcli', [
+          'device', 'wifi', 'hotspot', 
+          'ifname', wifiInterface, 
+          'con-name', conName, 
+          'ssid', ssid, 
+          'password', password
+        ]);
         
-        final result = await Process.run('nmcli', args);
         if (result.exitCode != 0) {
-           // Final fallback without ifname
-           final resultNoIf = await Process.run('nmcli', ['device', 'wifi', 'hotspot', 'ssid', ssid, 'password', password]);
-           return resultNoIf.exitCode == 0;
+           print('Hotspot failed: ${result.stderr}');
+           return false;
         }
         return true;
       } catch (e) {
@@ -104,7 +135,6 @@ class ConnectivityService {
       }
     } else if (Platform.isWindows) {
       try {
-        // Note: netsh hostednetwork is legacy, but often works for simple cases.
         await Process.run('netsh', ['wlan', 'set', 'hostednetwork', 'mode=allow', 'ssid=$ssid', 'key=$password']);
         final result = await Process.run('netsh', ['wlan', 'start', 'hostednetwork']);
         return result.exitCode == 0;
@@ -121,6 +151,7 @@ class ConnectivityService {
       await WiFiForIoTPlugin.setEnabled(true);
     } else if (Platform.isLinux) {
       await Process.run('nmcli', ['radio', 'wifi', 'on']);
+      await Process.run('rfkill', ['unblock', 'wifi']);
     } else if (Platform.isWindows) {
       await Process.run('netsh', ['interface', 'set', 'interface', 'name="Wi-Fi"', 'admin=enabled']);
     }
@@ -132,29 +163,18 @@ class ConnectivityService {
       await WiFiForIoTPlugin.setWiFiAPEnabled(false);
     } else if (Platform.isLinux) {
       try {
-        // Find wifi interface dynamically
+        final conName = 'Antigravity-Hotspot';
+        await Process.run('nmcli', ['connection', 'down', conName]);
+        await Process.run('nmcli', ['connection', 'delete', conName]);
+        
         final ifaceResult = await Process.run('nmcli', ['-t', '-f', 'DEVICE,TYPE', 'device']);
-        String wifiInterface = 'wlan0'; // Default fallback
         if (ifaceResult.exitCode == 0) {
            for (final line in ifaceResult.stdout.toString().split('\n')) {
-             if (line.endsWith(':wifi')) {
-               wifiInterface = line.split(':')[0];
-                                 break;
+             if (line.contains(':wifi')) {
+               final iface = line.split(':')[0];
+               await Process.run('nmcli', ['device', 'set', iface, 'managed', 'yes']);
              }
            }
-        }
-        await Process.run('nmcli', ['device', 'set', wifiInterface, 'managed', 'yes']);
-        await Process.run('nmcli', ['device', 'disconnect', wifiInterface]);
-        
-        // Clean up: delete hotspot connections to avoid clutter
-        final connResult = await Process.run('nmcli', ['-t', '-f', 'NAME,TYPE', 'connection', 'show']);
-        if (connResult.exitCode == 0) {
-          for (final line in connResult.stdout.toString().split('\n')) {
-            if (line.contains('Hotspot') && line.endsWith(':802-11-wireless')) {
-               final name = line.split(':')[0];
-               await Process.run('nmcli', ['connection', 'delete', name]);
-            }
-          }
         }
       } catch (e) {
          print('Linux Stop Hotspot error: $e');
@@ -169,7 +189,10 @@ class ConnectivityService {
   static Future<bool> connectToWifi({required String ssid, required String password}) async {
     if (Platform.isAndroid) {
       try {
-        // Disconnect from current if needed
+        print('Android: Force enabling WiFi before connection...');
+        await WiFiForIoTPlugin.setEnabled(true);
+        await Future.delayed(const Duration(seconds: 1));
+
         await WiFiForIoTPlugin.disconnect();
         
         final success = await WiFiForIoTPlugin.connect(
@@ -181,12 +204,10 @@ class ConnectivityService {
         
         if (!success) return false;
 
-        // NEW: Wait for actual connection state
         for (int i = 0; i < 15; i++) {
            final isConnected = await WiFiForIoTPlugin.isConnected();
            final currentSsid = await WiFiForIoTPlugin.getSSID();
            if (isConnected && (currentSsid == ssid || currentSsid == '"$ssid"')) {
-              // Force usage of this network even if it has no internet
               await WiFiForIoTPlugin.forceWifiUsage(true);
               return true;
            }
@@ -207,9 +228,6 @@ class ConnectivityService {
       }
     } else if (Platform.isWindows) {
       try {
-        // Windows joining via CMD is complex (needs XML profile), 
-        // but simple netsh command can work if profile exists.
-        // We'll try to use a PowerShell snippet for a more modern approach.
         final psCommand = 'netsh wlan connect name="$ssid" ssid="$ssid"';
         final result = await Process.run('powershell', ['-Command', psCommand]);
         return result.exitCode == 0;
@@ -230,7 +248,7 @@ class ConnectivityService {
     int? port,
   }) {
     return json.encode({
-      't': type, // 'p' for pc_config, 'd' for direct_connect
+      't': type,
       's': ssid,
       'p': password,
       'i': ip,

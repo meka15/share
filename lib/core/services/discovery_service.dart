@@ -9,11 +9,21 @@ class DiscoveryService {
   RawDatagramSocket? _socket;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
+  Timer? _arpTimer; // ARP scan for hotspot mode
   
   final _deviceController = StreamController<List<SharedDeviceInfo>>.broadcast();
   final Map<String, SharedDeviceInfo> _discoveredDevicesMap = {};
 
   Stream<List<SharedDeviceInfo>> get deviceStream => _deviceController.stream;
+
+  // Safe send — never throws, just prints on error
+  void _safeSend(List<int> bytes, InternetAddress address) {
+    try {
+      _socket?.send(bytes, address, _broadcastPort);
+    } catch (e) {
+      // Silently ignore unreachable addresses — this is normal in hotspot mode
+    }
+  }
 
   Future<void> start({required int port}) async {
     final deviceName = await DeviceUtil.getDeviceName();
@@ -29,12 +39,11 @@ class DiscoveryService {
     );
     _socket?.broadcastEnabled = true;
     
-    // Join Multicast group for more reliable discovery on some systems
+    // Join Multicast group (optional, may fail on some systems)
     try {
       _socket?.joinMulticast(InternetAddress('224.0.0.1'));
-      _socket?.joinMulticast(InternetAddress('239.255.255.250')); // SSDP group
     } catch (e) {
-      print('Multicast join error: $e');
+      // Multicast not supported on this interface — fine
     }
 
     _socket?.listen((event) {
@@ -57,7 +66,7 @@ class DiscoveryService {
               _discoveredDevicesMap[device.id] = device;
               _deviceController.add(_discoveredDevicesMap.values.toList());
 
-              // Fix: Direct response if it's a broadcast
+              // Direct response if it's a broadcast
               if (data['msgType'] == 'broadcast') {
                 _sendResponse(datagram.address, deviceId, deviceName, port, deviceType);
               }
@@ -69,17 +78,17 @@ class DiscoveryService {
       }
     });
 
-    // 2. Start broadcasting
+    // 2. Start broadcasting every 3s
     _broadcastTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
       _sendBroadcast(deviceId, deviceName, port, deviceType);
     });
 
-    // 3. Stale cleanup
-    _cleanupTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+    // 3. Stale cleanup every 15s
+    _cleanupTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
       final now = DateTime.now();
       bool changed = false;
       _discoveredDevicesMap.removeWhere((id, device) {
-        if (now.difference(device.lastSeen).inSeconds > 20) {
+        if (now.difference(device.lastSeen).inSeconds > 60) {
           changed = true;
           return true;
         }
@@ -88,8 +97,22 @@ class DiscoveryService {
       if (changed) _deviceController.add(_discoveredDevicesMap.values.toList());
     });
 
+    // 4. ARP scan timer — critical for Linux hotspot mode
+    // When PC is the hotspot, the phone connects but might not respond to UDP broadcasts.
+    // The ARP table tells us which devices are connected, so we can target them directly.
+    if (Platform.isLinux) {
+      _arpTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+        _scanArpTable(deviceId, deviceName, port, deviceType);
+      });
+    }
+
     // Initial broadcast
-    await _sendBroadcast(deviceId, deviceName, port, deviceType);
+    _sendBroadcast(deviceId, deviceName, port, deviceType);
+    
+    // Also do an initial ARP scan
+    if (Platform.isLinux) {
+      _scanArpTable(deviceId, deviceName, port, deviceType);
+    }
   }
 
   Future<void> _sendBroadcast(String id, String name, int port, String type) async {
@@ -102,8 +125,8 @@ class DiscoveryService {
     });
     final bytes = utf8.encode(message);
     
-    // 1. Send to global broadcast address
-    _socket?.send(bytes, InternetAddress('255.255.255.255'), _broadcastPort);
+    // 1. Try global broadcast (may fail in hotspot mode — that's OK)
+    _safeSend(bytes, InternetAddress('255.255.255.255'));
     
     // 2. Iterate through all network interfaces
     try {
@@ -115,38 +138,17 @@ class DiscoveryService {
             if (parts.length == 4) {
               final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
               
-              // Standard Subnet Broadcast
-              _socket?.send(bytes, InternetAddress('$prefix.255'), _broadcastPort);
+              // Subnet broadcast
+              _safeSend(bytes, InternetAddress('$prefix.255'));
               
-              // Proactive Gateway and Neighbors sweep
-              // This is a life-saver for Android without WAN
-              _socket?.send(bytes, InternetAddress('$prefix.1'), _broadcastPort);
-              _socket?.send(bytes, InternetAddress('$prefix.254'), _broadcastPort);
+              // Gateway and edges
+              _safeSend(bytes, InternetAddress('$prefix.1'));
+              _safeSend(bytes, InternetAddress('$prefix.254'));
               
-              // Aggressive sweep for ALL IPs on the subnet
-              // This ensures we find devices like the one at .79 even if broadcasts are blocked.
-              // Sending 254 UDP packets is very fast on modern local networks.
-              for (int i = 2; i < 255; i++) {
+              // Full subnet sweep — ensures discovery even if broadcasts are blocked
+              for (int i = 2; i < 254; i++) {
                 if (parts[3] != i.toString()) {
-                   _socket?.send(bytes, InternetAddress('$prefix.$i'), _broadcastPort);
-                }
-              }
-
-              // Linux Specific: ARP Scavenger (Extremely reliable for Host mode)
-              if (Platform.isLinux) {
-                try {
-                  final arpData = await File('/proc/net/arp').readAsString();
-                  final lines = arpData.split('\n');
-                  for (final line in lines) {
-                    if (line.contains('0x2')) { // 0x2 means entry is valid/active
-                       final parts = line.trim().split(RegExp(r'\s+'));
-                       if (parts.isNotEmpty && parts[0].startsWith(prefix)) {
-                          _socket?.send(bytes, InternetAddress(parts[0]), _broadcastPort);
-                       }
-                    }
-                  }
-                } catch (e) {
-                  // Ignore if /proc/net/arp is not accessible
+                  _safeSend(bytes, InternetAddress('$prefix.$i'));
                 }
               }
             }
@@ -154,7 +156,40 @@ class DiscoveryService {
         }
       }
     } catch (e) {
-      // Ignore network errors
+      print('Interface enumeration error: $e');
+    }
+  }
+
+  /// Scan Linux ARP table for connected devices and send targeted discovery to them.
+  /// This is the most reliable way to find devices on a hosted hotspot.
+  Future<void> _scanArpTable(String id, String name, int port, String type) async {
+    try {
+      final arpData = await File('/proc/net/arp').readAsString();
+      final message = json.encode({
+        'msgType': 'broadcast',
+        'id': id,
+        'name': name,
+        'port': port,
+        'type': type,
+      });
+      final bytes = utf8.encode(message);
+      
+      final lines = arpData.split('\n');
+      for (final line in lines) {
+        // 0x2 means the ARP entry is valid/active (device is connected)
+        if (line.contains('0x2')) {
+          final parts = line.trim().split(RegExp(r'\s+'));
+          if (parts.isNotEmpty) {
+            final ip = parts[0];
+            // Only send to private IPs
+            if (ip.startsWith('10.') || ip.startsWith('192.168.') || ip.startsWith('172.')) {
+              _safeSend(bytes, InternetAddress(ip));
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // /proc/net/arp not accessible — not critical
     }
   }
 
@@ -167,10 +202,7 @@ class DiscoveryService {
       'type': type,
     });
     final bytes = utf8.encode(message);
-    _socket?.send(bytes, target, _broadcastPort);
-    
-    // Also send multicast response as fallback
-    _socket?.send(bytes, InternetAddress('224.0.0.1'), _broadcastPort);
+    _safeSend(bytes, target);
   }
 
   void addDevice(SharedDeviceInfo device) {
@@ -178,9 +210,46 @@ class DiscoveryService {
     _deviceController.add(_discoveredDevicesMap.values.toList());
   }
 
+  /// Refresh a device's lastSeen to keep it alive in the list.
+  void refreshDeviceByIp(String ip) {
+    bool changed = false;
+    for (final entry in _discoveredDevicesMap.entries) {
+      if (entry.value.ip == ip) {
+        _discoveredDevicesMap[entry.key] = entry.value.copyWith(lastSeen: DateTime.now());
+        changed = true;
+      }
+    }
+    if (changed) _deviceController.add(_discoveredDevicesMap.values.toList());
+  }
+
+  /// Add a device if not present, or refresh its lastSeen if already known.
+  /// Uses IP as the matching key to avoid duplicates.
+  void addOrRefreshDevice(SharedDeviceInfo device) {
+    String? existingKey;
+    for (final entry in _discoveredDevicesMap.entries) {
+      if (entry.value.ip == device.ip) {
+        existingKey = entry.key;
+        break;
+      }
+    }
+    if (existingKey != null) {
+      _discoveredDevicesMap[existingKey] = _discoveredDevicesMap[existingKey]!.copyWith(
+        lastSeen: DateTime.now(),
+        port: device.port,
+        name: device.name.startsWith('Link:') || device.name.startsWith('Host') 
+            ? _discoveredDevicesMap[existingKey]!.name
+            : device.name,
+      );
+    } else {
+      _discoveredDevicesMap[device.id] = device;
+    }
+    _deviceController.add(_discoveredDevicesMap.values.toList());
+  }
+
   Future<void> stop() async {
     _broadcastTimer?.cancel();
     _cleanupTimer?.cancel();
+    _arpTimer?.cancel();
     _socket?.close();
     _socket = null;
     _discoveredDevicesMap.clear();
@@ -189,8 +258,7 @@ class DiscoveryService {
 
   Future<void> restart({required int port}) async {
     await stop();
-    await Future.delayed(const Duration(seconds: 3)); // Increased delay for network stabilization
+    await Future.delayed(const Duration(seconds: 3));
     await start(port: port);
   }
-
 }
