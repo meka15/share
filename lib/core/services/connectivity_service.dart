@@ -21,7 +21,7 @@ class ConnectivityService {
       for (final interface in interfaces) {
         final name = interface.name.toLowerCase();
         // Priority to wifi/hotspot interfaces
-        if (name.contains('wlan') || name.contains('ap') || name.contains('wlp') || name.contains('p2p')) {
+        if (name.contains('wlan') || name.contains('ap') || name.contains('wlp') || name.contains('p2p') || name.contains('mobile') || name.contains('local')) {
           for (final addr in interface.addresses) {
             if (addr.type == InternetAddressType.IPv4 && !addr.isLoopback) return addr.address;
           }
@@ -135,9 +135,59 @@ class ConnectivityService {
       }
     } else if (Platform.isWindows) {
       try {
+        // Modern Windows 10/11 Mobile Hotspot API via PowerShell
+        // This is much more reliable than the legacy netsh hostednetwork and works on modern drivers.
+        // It also allows starting a hotspot even without an active internet connection by picking any available profile.
+        final psCommand = '''
+          \$ErrorActionPreference = "Stop"
+          Add-Type -AssemblyName System.Runtime.WindowsRuntime
+          \$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { \$_.Name -eq 'AsTask' -and \$_.GetParameters().Count -eq 1 -and \$_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+          Function Await(\$WinrtOperation) {
+              \$asTask = \$asTaskGeneric.MakeGenericMethod(\$WinrtOperation.GetType().GetInterfaces()[0].GetGenericArguments()[0])
+              \$task = \$asTask.Invoke(\$null, @(\$WinrtOperation))
+              \$task.Wait()
+              return \$task.Result
+          }
+
+          \$profile = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]::GetInternetConnectionProfile()
+          if (\$null -eq \$profile) {
+              \$profiles = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]::GetConnectionProfiles()
+              \$profile = \$profiles | Select-Object -First 1
+          }
+
+          if (\$null -eq \$profile) {
+              # If No profiles exist, we try to use the HostedNetwork fallback later
+              exit 1
+          }
+
+          \$tetheringManager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]::CreateFromConnectionProfile(\$profile)
+          
+          # Check if tethering is supported
+          \$capability = \$tetheringManager.GetTetheringCapability(\$tetheringManager.MaxAllowedConnections)
+          if (\$capability -ne 'Enabled') {
+              # Might be DisabledByOperator or hardware not supported, try netsh legacy as final fallback
+              exit 1
+          }
+
+          \$config = \$tetheringManager.GetCurrentAccessPointConfiguration()
+          \$config.Ssid = "$ssid"
+          \$config.Passphrase = "$password"
+          Await(\$tetheringManager.ConfigureAccessPointAsync(\$config))
+          \$result = Await(\$tetheringManager.StartTetheringAsync())
+          
+          if (\$result.Status -ne 'Success') {
+              exit 1
+          }
+          exit 0
+        ''';
+        
+        final result = await Process.run('powershell', ['-Command', psCommand]);
+        if (result.exitCode == 0) return true;
+        
+        // Fallback to legacy netsh if PowerShell/WinRT fails or is unsupported
         await Process.run('netsh', ['wlan', 'set', 'hostednetwork', 'mode=allow', 'ssid=$ssid', 'key=$password']);
-        final result = await Process.run('netsh', ['wlan', 'start', 'hostednetwork']);
-        return result.exitCode == 0;
+        final legacyResult = await Process.run('netsh', ['wlan', 'start', 'hostednetwork']);
+        return legacyResult.exitCode == 0;
       } catch (e) {
         print('Windows Hotspot error: $e');
         return false;
@@ -153,7 +203,9 @@ class ConnectivityService {
       await Process.run('nmcli', ['radio', 'wifi', 'on']);
       await Process.run('rfkill', ['unblock', 'wifi']);
     } else if (Platform.isWindows) {
+      // Try to enable Wi-Fi interface by name "Wi-Fi" (common) or via radio state
       await Process.run('netsh', ['interface', 'set', 'interface', 'name="Wi-Fi"', 'admin=enabled']);
+      await Process.run('powershell', ['-Command', 'Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*Wi-Fi*" } | Enable-NetAdapter -Confirm:$false']);
     }
   }
 
@@ -180,6 +232,30 @@ class ConnectivityService {
          print('Linux Stop Hotspot error: $e');
       }
     } else if (Platform.isWindows) {
+      try {
+        final psCommand = '''
+          Add-Type -AssemblyName System.Runtime.WindowsRuntime
+          \$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | ? { \$_.Name -eq 'AsTask' -and \$_.GetParameters().Count -eq 1 -and \$_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+          Function Await(\$WinrtOperation) {
+              \$asTask = \$asTaskGeneric.MakeGenericMethod(\$WinrtOperation.GetType().GetInterfaces()[0].GetGenericArguments()[0])
+              \$task = \$asTask.Invoke(\$null, @(\$WinrtOperation))
+              \$task.Wait()
+              return \$task.Result
+          }
+
+          \$profile = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]::GetInternetConnectionProfile()
+          if (\$null -eq \$profile) {
+              \$profiles = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]::GetConnectionProfiles()
+              \$profile = \$profiles | Select-Object -First 1
+          }
+
+          if (\$null -ne \$profile) {
+            \$tetheringManager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]::CreateFromConnectionProfile(\$profile)
+            Await(\$tetheringManager.StopTetheringAsync())
+          }
+        ''';
+        await Process.run('powershell', ['-Command', psCommand]);
+      } catch (_) {}
       await Process.run('netsh', ['wlan', 'stop', 'hostednetwork']);
     }
   }
